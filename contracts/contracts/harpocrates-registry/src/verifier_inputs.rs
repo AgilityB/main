@@ -208,6 +208,9 @@ pub fn parse_silent_witness(
     // is >= the scalar modulus by construction, so it is exempt from the
     // canonicity rule. Every other field is checked in index order.
     for element in fields.iter().take(SILENT_WITNESS_FIELD_COUNT - 1) {
+    // The domain tag is an opaque protocol binding; compare it byte-for-byte
+    // below instead of treating arbitrary SHA-256 output as a BN254 scalar.
+    for element in fields[..4].iter() {
         if !is_canonical_field(element) {
             return Err(RejectCode::NonCanonicalField);
         }

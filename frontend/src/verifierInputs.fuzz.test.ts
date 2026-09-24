@@ -299,7 +299,7 @@ describe('rejection signals', () => {
     const base = positiveFrames.get(SCHEMAS[0])!
     const rng = new Lcg(seed)
 
-    for (let index = 0; index < 128; index += 1) {
+    for (let index = 0; index < PUBLIC_INPUTS_LEN; index += 1) {
       const mutator = MUTATORS[rng.below(MUTATORS.length)]
       const mutant = mutate(base, mutator, rng)
 

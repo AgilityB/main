@@ -246,6 +246,9 @@ def parse_silent_witness_inputs(public_inputs: bytes) -> SilentWitnessInputs:
         fields[: SILENT_WITNESS_FIELD_COUNT - 1],
         _SILENT_WITNESS_FIELDS[: SILENT_WITNESS_FIELD_COUNT - 1],
     )
+    # The digest is an opaque protocol binding; compare it byte-for-byte below
+    # instead of treating arbitrary SHA-256 output as a BN254 scalar.
+    _require_canonical(fields[:4], _SILENT_WITNESS_FIELDS[:4])
 
     _require_non_zero(fields[2], "credential_root")
     _require_non_zero(fields[3], "nullifier")

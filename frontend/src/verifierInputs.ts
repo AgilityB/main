@@ -23,6 +23,9 @@ export const REVOCATION_FIELD_COUNT = 4
 export const SILENT_WITNESS_PUBLIC_INPUTS_LEN = FIELD_LEN * SILENT_WITNESS_FIELD_COUNT // 160
 export const REVOCATION_PUBLIC_INPUTS_LEN = FIELD_LEN * REVOCATION_FIELD_COUNT // 128
 /** Default frame length (largest schema), mirroring the Python codec. */
+export const SILENT_WITNESS_PUBLIC_INPUTS_LEN = FIELD_LEN * SILENT_WITNESS_FIELD_COUNT
+export const REVOCATION_PUBLIC_INPUTS_LEN = FIELD_LEN * REVOCATION_FIELD_COUNT
+/** Default frame length for the primary silent-witness verifier boundary. */
 export const PUBLIC_INPUTS_LEN = SILENT_WITNESS_PUBLIC_INPUTS_LEN
 
 export const MIN_PROOF_BYTES = 64
@@ -51,6 +54,7 @@ export const REVOCATION_DOMAIN_SEPARATOR_HEX =
  * Byte-for-byte identical to `expected_domain_tag()` in the Soroban registry
  * and `SILENT_WITNESS_DOMAIN_TAG` in backend/verifier_inputs.py.
  */
+/** SHA-256(protocol || version || network), embedded by the v1 Noir helper. */
 export const SILENT_WITNESS_DOMAIN_TAG_HEX =
   '4aa038f0a27b6675d7122ae2d4e197c21e83fbe30143a5c83ff35c9514b92c55'
 
@@ -144,6 +148,39 @@ function toBigInt(element: Uint8Array): bigint {
   return accumulator
 }
 
+/**
+ * Encode a Noir field using the wire format consumed by every verifier.
+ *
+ * Noir may return either decimal strings or `0x`-prefixed hex strings. The
+ * browser boundary always emits one lowercase, zero-padded 32-byte field and
+ * rejects values outside BN254 instead of silently reducing them modulo the
+ * field. This keeps proof/public-input bytes deterministic across clients.
+ */
+type NoirField = string | bigint | { toString(): string }
+
+export function encodeFieldToBytes32Hex(value: NoirField, field = 'field'): string {
+  let element: bigint
+  try {
+    element = typeof value === 'bigint' ? value : BigInt(value.toString())
+  } catch {
+    throw new VerifierInputError('malformed_hex', field)
+  }
+  if (element < 0n || element >= BN254_SCALAR_FIELD_MODULUS) {
+    throw new VerifierInputError('non_canonical_field', field)
+  }
+  return element.toString(16).padStart(FIELD_LEN * 2, '0')
+}
+
+/** Encode an ordered public-input vector without exposing witness material. */
+export function encodePublicInputs(
+  values: readonly NoirField[],
+  fields: readonly string[] = [],
+): string {
+  return values
+    .map((value, index) => encodeFieldToBytes32Hex(value, fields[index] ?? `field_${index}`))
+    .join('')
+}
+
 /** Is this 32-byte big-endian encoding strictly below the BN254 modulus? */
 export function isCanonicalField(element: Uint8Array): boolean {
   return element.length === FIELD_LEN && toBigInt(element) < BN254_SCALAR_FIELD_MODULUS
@@ -165,6 +202,8 @@ function splitFields(
   fieldCount: number,
 ): Uint8Array[] {
   if (publicInputs.length !== expectedLen) {
+function splitFields(publicInputs: Uint8Array, fieldCount: number): Uint8Array[] {
+  if (publicInputs.length !== FIELD_LEN * fieldCount) {
     throw new VerifierInputError('length', 'public_inputs')
   }
   const fields: Uint8Array[] = []
@@ -227,6 +266,7 @@ export function parseSilentWitnessInputs(publicInputs: Uint8Array): SilentWitnes
     SILENT_WITNESS_PUBLIC_INPUTS_LEN,
     SILENT_WITNESS_FIELD_COUNT,
   )
+  const fields = splitFields(publicInputs, SILENT_WITNESS_FIELD_COUNT)
 
   const high = requireHalfPadding(fields[0], 'video_hash_hi')
   const low = requireHalfPadding(fields[1], 'video_hash_lo')
@@ -236,6 +276,10 @@ export function parseSilentWitnessInputs(publicInputs: Uint8Array): SilentWitnes
   // construction, so it is exempt from the canonicity rule. Every other
   // field is checked in index order, matching the Python and Rust codecs.
   requireCanonical(fields.slice(0, -1), SILENT_WITNESS_FIELDS.slice(0, -1))
+  // The domain tag is an opaque 32-byte protocol binding, not a user-supplied
+  // BN254 scalar. It is compared byte-for-byte below and is intentionally not
+  // reduced or rejected merely because its digest is above the modulus.
+  requireCanonical(fields.slice(0, 4), SILENT_WITNESS_FIELDS.slice(0, 4))
 
   requireNonZero(fields[2], 'credential_root')
   requireNonZero(fields[3], 'nullifier')
@@ -247,6 +291,8 @@ export function parseSilentWitnessInputs(publicInputs: Uint8Array): SilentWitnes
     if (domain[index] !== expectedDomain[index]) {
       throw new VerifierInputError('domain_mismatch', 'domain_tag')
     }
+  if (fields[4].some((byte, index) => byte !== expectedDomain[index])) {
+    throw new VerifierInputError('domain_mismatch', 'domain_tag')
   }
 
   return {
@@ -254,6 +300,7 @@ export function parseSilentWitnessInputs(publicInputs: Uint8Array): SilentWitnes
     credentialRoot: fields[2],
     nullifier: fields[3],
     domainTag: domain,
+    domainTag: fields[4],
   }
 }
 
@@ -266,6 +313,7 @@ export function parseRevocationWitnessInputs(
     REVOCATION_PUBLIC_INPUTS_LEN,
     REVOCATION_FIELD_COUNT,
   )
+  const fields = splitFields(publicInputs, REVOCATION_FIELD_COUNT)
 
   requireCanonical(fields, REVOCATION_FIELDS)
 
