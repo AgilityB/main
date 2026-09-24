@@ -21,6 +21,7 @@ docs/zk-conformance-vectors.md.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -30,7 +31,7 @@ CODEC_ID = "hpx-vi/1"
 VECTOR_VERSION = 1
 
 FIELD_LEN = 32
-PUBLIC_INPUTS_LEN = 128
+PUBLIC_INPUTS_LEN = 160
 MIN_PROOF_BYTES = 64
 MAX_PROOF_BYTES = 65536
 
@@ -43,6 +44,21 @@ BN254_R_HEX = "30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001"
 # 7 zero bytes of BN254 padding followed by the 25 ASCII bytes of
 # "HARPOCRATES_REVOCATION_V1".
 DOMAIN_HEX = ("00" * 7) + b"HARPOCRATES_REVOCATION_V1".hex()
+
+# Must byte-for-byte match expected_domain_tag() in
+# contracts/contracts/harpocrates-registry/src/lib.rs and
+# backend/verifier_inputs.py: SHA-256 over the three pre-hashed domain fields.
+DOMAIN_PROTOCOL_FIELD_HEX = "261e9f6e39e3c1ae6aca9f29e84c10d59c82d5f4b40c21c1b7e3c01ad571c201"
+DOMAIN_VERSION_FIELD_HEX = "0c89eff4ec8e39a01e9f19547a0cc9dd7fd2a97d79ba4d94fd32e97a1f5ac623"
+DOMAIN_NETWORK_FIELD_HEX = "2a2c3f48ce2e3c2f1e6c89b18d64b5f5c1f88a59a0d9bc82cb61a1e8cb77a50f"
+SILENT_DOMAIN_HEX = hashlib.sha256(
+    bytes.fromhex(DOMAIN_PROTOCOL_FIELD_HEX)
+    + bytes.fromhex(DOMAIN_VERSION_FIELD_HEX)
+    + bytes.fromhex(DOMAIN_NETWORK_FIELD_HEX)
+).hexdigest()
+# Self-check: the value embedded in every silent-witness frame must stay in
+# lockstep with the contract's expected_domain_tag().
+assert SILENT_DOMAIN_HEX == "4aa038f0a27b6675d7122ae2d4e197c21e83fbe30143a5c83ff35c9514b92c55"
 
 ZERO = "00" * FIELD_LEN
 ONES = "ff" * FIELD_LEN
@@ -60,8 +76,10 @@ PROOF_MIN = "ab" * MIN_PROOF_BYTES
 PROOF_TYPICAL = "cd" * 512
 
 
-def silent(hi: str, lo: str, root: str, nullifier: str) -> str:
-    return hi + lo + root + nullifier
+def silent(
+    hi: str, lo: str, root: str, nullifier: str, domain: str = SILENT_DOMAIN_HEX
+) -> str:
+    return hi + lo + root + nullifier + domain
 
 
 def revocation(root: str, nullifier: str, domain: str, credential: str) -> str:
@@ -168,7 +186,7 @@ def build_cases() -> list[dict[str, object]]:
         case(
             "sw-neg-002-truncated-one-byte",
             "silent_witness/v1",
-            "127 bytes: one byte short of a full frame.",
+            "One byte short of a full frame.",
             SILENT_VALID[:-2],
             "length",
         )
@@ -177,8 +195,8 @@ def build_cases() -> list[dict[str, object]]:
         case(
             "sw-neg-003-truncated-one-field",
             "silent_witness/v1",
-            "96 bytes: a whole field element missing.",
-            SILENT_VALID[: 96 * 2],
+            "128 bytes: a whole field element missing.",
+            SILENT_VALID[: 128 * 2],
             "length",
         )
     )
@@ -186,7 +204,7 @@ def build_cases() -> list[dict[str, object]]:
         case(
             "sw-neg-004-oversized-one-byte",
             "silent_witness/v1",
-            "129 bytes: one trailing byte past the frame.",
+            "One trailing byte past the full frame.",
             SILENT_VALID + "00",
             "length",
         )
@@ -391,6 +409,7 @@ def build_document() -> dict[str, object]:
                 "video_hash_lo",
                 "credential_root",
                 "nullifier",
+                "domain_tag",
             ],
             "revocation_witness/v1": [
                 "revocation_root",

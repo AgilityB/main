@@ -203,7 +203,11 @@ pub fn parse_silent_witness(
         return Err(RejectCode::Padding);
     }
 
-    for element in fields.iter() {
+    // The domain tag (index 4) is a raw SHA-256 digest compared byte-wise
+    // against the expected tag, not a BN254 field element: the expected tag
+    // is >= the scalar modulus by construction, so it is exempt from the
+    // canonicity rule. Every other field is checked in index order.
+    for element in fields.iter().take(SILENT_WITNESS_FIELD_COUNT - 1) {
         if !is_canonical_field(element) {
             return Err(RejectCode::NonCanonicalField);
         }
@@ -297,4 +301,3 @@ pub fn classify(
 
     check_proof_bounds(proof_len)
 }
-

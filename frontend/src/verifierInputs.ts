@@ -18,8 +18,12 @@
 export const CODEC_ID = 'hpx-vi/1'
 
 export const FIELD_LEN = 32
-export const FIELD_COUNT = 4
-export const PUBLIC_INPUTS_LEN = FIELD_LEN * FIELD_COUNT
+export const SILENT_WITNESS_FIELD_COUNT = 5
+export const REVOCATION_FIELD_COUNT = 4
+export const SILENT_WITNESS_PUBLIC_INPUTS_LEN = FIELD_LEN * SILENT_WITNESS_FIELD_COUNT // 160
+export const REVOCATION_PUBLIC_INPUTS_LEN = FIELD_LEN * REVOCATION_FIELD_COUNT // 128
+/** Default frame length (largest schema), mirroring the Python codec. */
+export const PUBLIC_INPUTS_LEN = SILENT_WITNESS_PUBLIC_INPUTS_LEN
 
 export const MIN_PROOF_BYTES = 64
 export const MAX_PROOF_BYTES = 65536
@@ -41,6 +45,14 @@ export const BN254_SCALAR_FIELD_MODULUS =
  */
 export const REVOCATION_DOMAIN_SEPARATOR_HEX =
   '00000000000000484152504f4352415445535f5245564f434154494f4e5f5631'
+
+/**
+ * SHA-256(DOMAIN_PROTOCOL_FIELD || DOMAIN_VERSION_FIELD || DOMAIN_NETWORK_FIELD).
+ * Byte-for-byte identical to `expected_domain_tag()` in the Soroban registry
+ * and `SILENT_WITNESS_DOMAIN_TAG` in backend/verifier_inputs.py.
+ */
+export const SILENT_WITNESS_DOMAIN_TAG_HEX =
+  '4aa038f0a27b6675d7122ae2d4e197c21e83fbe30143a5c83ff35c9514b92c55'
 
 export const SCHEMA_SILENT_WITNESS = 'silent_witness/v1'
 export const SCHEMA_REVOCATION_WITNESS = 'revocation_witness/v1'
@@ -86,6 +98,7 @@ export type SilentWitnessInputs = {
   videoHash: Uint8Array
   credentialRoot: Uint8Array
   nullifier: Uint8Array
+  domainTag: Uint8Array
 }
 
 export type RevocationWitnessInputs = {
@@ -146,12 +159,16 @@ export function checkProofBounds(proof: Uint8Array): void {
   }
 }
 
-function splitFields(publicInputs: Uint8Array): Uint8Array[] {
-  if (publicInputs.length !== PUBLIC_INPUTS_LEN) {
+function splitFields(
+  publicInputs: Uint8Array,
+  expectedLen: number,
+  fieldCount: number,
+): Uint8Array[] {
+  if (publicInputs.length !== expectedLen) {
     throw new VerifierInputError('length', 'public_inputs')
   }
   const fields: Uint8Array[] = []
-  for (let index = 0; index < FIELD_COUNT; index += 1) {
+  for (let index = 0; index < fieldCount; index += 1) {
     fields.push(publicInputs.slice(index * FIELD_LEN, (index + 1) * FIELD_LEN))
   }
   return fields
@@ -193,6 +210,7 @@ const SILENT_WITNESS_FIELDS = [
   'video_hash_lo',
   'credential_root',
   'nullifier',
+  'domain_tag',
 ] as const
 
 const REVOCATION_FIELDS = [
@@ -204,20 +222,38 @@ const REVOCATION_FIELDS = [
 
 /** Parse `silent_witness/v1` public inputs in canonical check order. */
 export function parseSilentWitnessInputs(publicInputs: Uint8Array): SilentWitnessInputs {
-  const fields = splitFields(publicInputs)
+  const fields = splitFields(
+    publicInputs,
+    SILENT_WITNESS_PUBLIC_INPUTS_LEN,
+    SILENT_WITNESS_FIELD_COUNT,
+  )
 
   const high = requireHalfPadding(fields[0], 'video_hash_hi')
   const low = requireHalfPadding(fields[1], 'video_hash_lo')
 
-  requireCanonical(fields, SILENT_WITNESS_FIELDS)
+  // The domain tag (index 4) is a raw SHA-256 digest compared byte-wise, not
+  // a BN254 field element: the expected tag is >= the scalar modulus by
+  // construction, so it is exempt from the canonicity rule. Every other
+  // field is checked in index order, matching the Python and Rust codecs.
+  requireCanonical(fields.slice(0, -1), SILENT_WITNESS_FIELDS.slice(0, -1))
 
   requireNonZero(fields[2], 'credential_root')
   requireNonZero(fields[3], 'nullifier')
+  requireNonZero(fields[4], 'domain_tag')
+
+  const expectedDomain = decodeHex(SILENT_WITNESS_DOMAIN_TAG_HEX, 'domain_tag')
+  const domain = fields[4]
+  for (let index = 0; index < FIELD_LEN; index += 1) {
+    if (domain[index] !== expectedDomain[index]) {
+      throw new VerifierInputError('domain_mismatch', 'domain_tag')
+    }
+  }
 
   return {
     videoHash: concat(high, low),
     credentialRoot: fields[2],
     nullifier: fields[3],
+    domainTag: domain,
   }
 }
 
@@ -225,7 +261,11 @@ export function parseSilentWitnessInputs(publicInputs: Uint8Array): SilentWitnes
 export function parseRevocationWitnessInputs(
   publicInputs: Uint8Array,
 ): RevocationWitnessInputs {
-  const fields = splitFields(publicInputs)
+  const fields = splitFields(
+    publicInputs,
+    REVOCATION_PUBLIC_INPUTS_LEN,
+    REVOCATION_FIELD_COUNT,
+  )
 
   requireCanonical(fields, REVOCATION_FIELDS)
 
