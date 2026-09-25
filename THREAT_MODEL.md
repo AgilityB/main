@@ -1,7 +1,7 @@
 # Harpocrates Protocol Threat Model
 
-**Version:** 1.0  
-**Date:** 2026-07-24  
+**Version:** 1.2  
+**Date:** 2026-09-24  
 **Status:** Active  
 **Review cadence:** Every major protocol change or at minimum every six months.  
 **Maintainer:** See `CODEOWNERS`.
@@ -158,6 +158,16 @@ Stellar private key. All on-chain operations are validated by the Soroban VM.
 **TB-3 Backend → NeonDB:** The backend writes proof events using parameterized
 queries via `psycopg`. `DATABASE_URL` is read from the environment and never
 logged. The NeonDB row schema does not store ZK secrets.
+
+**TB-4 Offline local verification (client → nothing):** When the Verification
+Portal runs "Offline local check", the browser performs the hash, stego
+extraction, structural validation, and file→metadata binding with zero network
+calls and no storage or log writes. This boundary produces **no trust
+decision**: a verifier must still consult the registry (TB-2) and event feed
+(TB-3) to confirm revocation, expiry, or nullifier replay, so offline success
+is reported only as a local check with chain/registry status "not checked".
+Envelopes carrying secret-shaped keys are rejected before any field is read,
+and output copy never carries file names, hashes, or secret material.
 
 ---
 
@@ -628,6 +638,7 @@ must be reconciled against on-chain data for any security-sensitive decision.
 | Browser-side Noir proving — secrets never sent to server in production | T4, T5 | `noirClient.ts` → `generateSilentWitnessProof` |
 | **Worker-isolated proving** — Noir proving runs in a dedicated Web Worker which is explicitly terminated upon success, failure, timeout, or cancellation. This guarantees the browser reclaims the memory hardware-isolate and drops all secrets reliably, rather than depending on GC. | T4, T5 | `proveWorker.ts`, `noirClient.ts` |
 | Network passphrase guard (blocks wrong Stellar network) | T1 | `networkGuard.ts` → `checkNetworkMatch` |
+| Offline local verification — zero network calls, no storage/log writes, and never a confirmed trust decision; envelope extraction reuses the existing single stego loader (no second protocol truth) and secret-shaped envelopes are rejected up-front | T4, T5 | `offlineVerification.ts`, `useVerification.ts` |
 | Hex normalization and validation on all hash inputs | T1, T8 | `stellarEncoding.ts` → `asHex32`, `asHexBytes` |
 | `CONTRACT_NETWORK_PASSPHRASE` exported constant used by guard | T1 | `harpocratesRegistry.ts` |
 
@@ -783,7 +794,50 @@ privileged contract event is emitted.
 
 ---
 
-### OR-10 Threshold Seal Policy Governance
+### OR-11 Unbounded External Evidence Fetch
+
+**Severity:** Medium — **Resolved** in #287  
+**Component:** Flask backend (`tx_verification.py`, `webhook.py`)  
+**Description:** The backend makes outbound HTTP calls to two external systems:
+
+1. **Stellar Horizon** — `tx_verification_loop` polls
+   `/transactions/{tx_hash}` on `horizon-testnet.stellar.org` to resolve
+   pending transaction statuses.
+2. **Webhook subscribers** — `dispatch_webhook` `POST`s evidence events to
+   operator-configured subscriber URLs.
+
+Prior to this fix both calls used `urllib.request.urlopen(req, timeout=10)`.
+A single `timeout=` value covers only the *read* phase in Python's
+implementation; the TCP+TLS connect phase was unlimited. Additionally, the full
+response body was buffered without a size cap, allowing a malicious or
+misbehaving remote host to stall the worker indefinitely or exhaust heap memory
+with an arbitrarily large response.
+
+Privacy implication: pre-fix log lines included the raw transaction hash and
+the subscriber URL in WARNING-level messages, which could leak correlation data
+into log aggregation systems.
+
+**Mitigations implemented** (`backend/fetch_external.py` + callers):
+
+| Property | Mechanism | Default |
+|----------|-----------|---------|
+| Connect timeout | `socket_timeout = max(connect, read)` passed to `urlopen` | 5 s |
+| Read timeout | Same `socket_timeout` covers each `recv` call | 10 s |
+| Response-size cap | Chunked read with hard limit; raises `ResponseTooLargeError` | 64 KiB |
+| Privacy-safe logging | URLs and tx-hashes logged at DEBUG only; WARNING messages log `host` only | — |
+| Config-driven | Three new `AppConfig` fields (`EXTERNAL_FETCH_CONNECT_TIMEOUT_SECONDS`, `EXTERNAL_FETCH_READ_TIMEOUT_SECONDS`, `EXTERNAL_FETCH_MAX_RESPONSE_BYTES`) override defaults via env vars | — |
+
+**Compatibility:** Existing callers pass no new arguments; all three parameters
+default to the values that were previously hard-coded. No API or protocol
+surface change.
+
+**Rollback:** Remove `fetch_external.py`, revert `tx_verification.py` and
+`webhook.py` to direct `urlopen` calls, and remove the three new config fields.
+No database migration required.
+
+---
+
+### OR-12 Threshold Seal Policy Governance
 
 **Severity:** Medium  
 **Component:** Soroban contract  
@@ -834,6 +888,11 @@ The following are explicitly outside the scope of this threat model:
 - **Dependency vulnerability management** — routine CVE scanning and patching
   of npm and Python dependencies is a continuous operations concern, not
   addressed here.
+- **Validating Silent Witness proof bytes offline** — offline local verification
+  checks hash, envelope structure, and file binding only. Proof-byte validation
+  requires the UltraHonk verifier (contract or WASM with the matching circuit
+  artifact) and is intentionally not performed in offline mode; it is also not
+  embedded into the canonical metadata, so no second protocol truth is created.
 
 ---
 
@@ -875,6 +934,32 @@ upload and proof endpoints.
 | Migration | Additive; `RATELIMIT_ENABLED=false` disables the layer without changing routes |
 | Rollback | Remove `@limiter.limit` decorators; endpoints behave as before |
 
+## 9.3 C2PA Authenticity Assertion Export
+
+**Artifact:** `cli/src/c2pa.ts` (`harpocrates c2pa`), schema version 1,
+exporter `harpocrates-cli/c2pa` v1.0.0.
+
+`harpocrates c2pa` derives C2PA authenticity assertions from the canonical
+proof manifest and (optionally) a verification receipt. It produces an
+**unsigned** C2PA JSON manifest definition; downstream tooling signs it with
+its own C2PA signer and key material.
+
+| Property | Guarantee |
+|----------|-----------|
+| Trust boundary | Local output byte stream; the caller's C2PA signer and the target media platform become the consumers |
+| Single truth | All values come from the canonical manifest/receipt schemas; `manifestHash` = SHA-256 of the canonical serialized manifest, so the export cannot drift into a second metadata truth |
+| Privacy | Only public manifest/registry fields are emitted; media bytes, witness values, credential secrets, proof bytes, transaction blobs, and signing keys are never emitted, and the exporter never signs |
+| Verification honesty | `harpocrates.verification.v1` records the receipt outcome verbatim (`valid`/`expired`/`revoked`/`not_found`/`pending`/`failed`/...); a `valid` status is never fabricated |
+| Determinism | Same manifest + receipt ⇒ identical output bytes (CI-verified against `devx/fixtures/c2pa/expected-export.json`) |
+| Input guards | Manifest/receipt capped at 1 MiB input, 256 KiB output; unknown manifest fields and unsupported versions rejected with fixed, privacy-safe errors (exit 8) |
+| Migration | Additive; schema version `1` carried in the export, no on-chain or metadata schema change |
+| Rollback | Deploy the prior CLI build; existing receipt shape and exit-code mapping unchanged |
+
+For upstream threat coverage, the export output sits at TB-2 (browser/user →
+Stellar RPC) and TB-1 (local tooling boundary): it publishes hashes and
+registry identity that are public after registration, and it never accesses
+A1/A2 (credential/nullifier secrets) or A8/A9 keypairs.
+
 ## 10. Review and Update Cadence
 
 | Trigger | Action |
@@ -885,6 +970,7 @@ upload and proof endpoints.
 | New backend endpoint or authentication change | Re-review T1, T6, T10. |
 | Admin key rotation | Update D3; verify two-step transfer completed cleanly. |
 | Any new npm or Python dependency with network access | Assess supply-chain risk (T4). |
+| Any change to the CLI C2PA exporter (`cli/src/c2pa.ts`, `harpocrates c2pa`) | Re-review Section 9.3; regenerate the committed fixture. |
 | Scheduled review | Every six months from the date of last update, regardless of changes. |
 
 When updating this document, increment the version number, update the date, and
@@ -894,5 +980,4 @@ add a one-line change summary below:
 |---------|------|---------|
 | 1.0 | 2026-07-24 | Initial threat model. Covers all four components. Nine open risks identified. |
 | 1.1 | 2026-07-26 | Add OR-10: Threshold seal policy governance (m-of-n Public Seal). |
-| 1.2 | 2026-09-24 | Document privacy-safe backend trace fields (`harpocrates-trace-v1`). |
-| 1.3 | 2026-09-24 | Expose/allowed propagation headers through the CORS policy. |
+| 1.2 | 2026-09-24 | Add OR-11: Unbounded external evidence fetch — resolved in #287. Connect timeout, response-size cap, and privacy-safe logging enforced via fetch_external.safe_urlopen. |
