@@ -2,6 +2,12 @@
 
 ## 1.0.0 — Unreleased
 
+- Domain-separated proof-cache keys in the backend verifier cache (#373): keys
+  are SHA-256 digests over the versioned `harpocrates:verifier-cache:v1` domain
+  tag plus length-prefixed fields, eliminating separator-ambiguity collisions
+  and cross-domain key reuse; hex proof/public-input inputs are case- and
+  whitespace-canonicalized. Bump the tag to invalidate all cached entries.
+
 - Added a CI end-to-end environment matrix (`devx/e2e_env_matrix.py`) that exercises public API boundaries across development/testing/production-like profiles with privacy-safe failure checks.
 
 - Added an atomic compatibility manifest and release gate spanning frontend,
